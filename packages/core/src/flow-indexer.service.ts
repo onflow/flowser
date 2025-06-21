@@ -18,6 +18,7 @@ import {
 import { ensurePrefixedAddress } from "./utils";
 import { IFlowserLogger } from "./logger";
 import { FclValue } from "./fcl-value";
+import { deriveFlowAddressFromPrivateKey } from './crypto-utils';
 
 type UnprocessedBlockInfo = {
   nextBlockHeightToProcess: number;
@@ -670,5 +671,37 @@ export class FlowIndexerService {
       ...signable,
       address: ensurePrefixedAddress(signable.address),
     }));
+  }
+
+  public async processServiceAccountFromPrivateKey(privateKey: string | undefined): Promise<void> {
+    if (!privateKey) {
+      this.logger.debug('No service private key provided, skipping service account processing.');
+      return;
+    }
+
+    try {
+      this.logger.debug('Attempting to derive service account address from private key.');
+      const address = deriveFlowAddressFromPrivateKey(privateKey);
+      this.logger.info(`Service account address derived: ${address}. Fetching account details.`);
+
+      // Fetch and store the account
+      // The existing createAccount method fetches, creates entities for account, keys, contracts
+      // and stores them in the respective indexes.
+      await this.createAccount(address);
+      this.logger.info(`Successfully processed and indexed service account: ${address}`);
+
+    } catch (error: any) {
+      if (error.message?.includes('Invalid private key format')) {
+        this.logger.error(`Invalid service private key format: ${error.message}`);
+      } else if (error.message?.includes('Failed to derive Flow address')) {
+         this.logger.error(`Failed to derive Flow address from service private key: ${error.message}`);
+      } else {
+        // This could be an error from flowGatewayService.getAccount (e.g., account not found)
+        // or other unexpected errors.
+        this.logger.error(`Error processing service account: ${error.message}`, error.stack);
+      }
+      // We don't re-throw here as failing to process a service account
+      // shouldn't necessarily stop the entire indexing process.
+    }
   }
 }

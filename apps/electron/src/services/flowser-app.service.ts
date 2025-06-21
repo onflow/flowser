@@ -6,6 +6,7 @@ import {
   FlowSnapshotsService,
   IFlowserLogger,
   InMemoryIndex,
+  getFlowAccountDetailsFromPrivateKey
 } from '@onflowser/core';
 import {
   AsyncIntervalScheduler,
@@ -327,6 +328,30 @@ export class FlowserAppService {
 
     this.blockchainIndexService.clear();
     this.processingScheduler.start();
+
+    // Process service account from private key if provided for indexing
+    await this.flowIndexerService.processServiceAccountFromPrivateKey(workspace.emulator?.servicePrivateKey);
+
+    // Also, make the service account available in WalletService for UI selection
+    if (workspace.emulator?.servicePrivateKey) {
+      try {
+        const accountDetails = getFlowAccountDetailsFromPrivateKey(workspace.emulator.servicePrivateKey);
+        this.walletService.setUserServiceAccount(
+          {
+            address: accountDetails.address,
+            publicKey: accountDetails.publicKey,
+            privateKey: "managed-by-workspace-settings" // Placeholder to mark as managed
+          },
+          workspace.emulator.servicePrivateKey // Pass the actual private key
+        );
+        this.logger.debug(`User service account ${accountDetails.address} set for WalletService.`);
+      } catch (e: any) {
+        this.logger.error(`Failed to derive user service account from private key: ${e.message}`);
+        this.walletService.setUserServiceAccount(null, null); // Clear both keyPair and actual private key
+      }
+    } else {
+      this.walletService.setUserServiceAccount(null, null); // Clear both keyPair and actual private key
+    }
 
     await this.walletService.synchronizeIndex();
     await this.flowSnapshotsService.synchronizeIndex();

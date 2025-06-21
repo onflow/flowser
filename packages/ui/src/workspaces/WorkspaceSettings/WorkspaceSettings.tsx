@@ -32,6 +32,9 @@ import { useGetFlowCliInfo } from "../../api";
 const projectSchema = yup.object().shape({
   name: yup.string().required("Required"),
   filesystemPath: yup.string().required("Required"),
+  emulator: yup.object().shape({
+    servicePrivateKey: yup.string(),
+  }),
 });
 
 type ProjectSettingsProps = {
@@ -65,7 +68,7 @@ export const WorkspaceSettings: FunctionComponent<ProjectSettingsProps> = (
     if (!isExistingProject) {
       track(AnalyticEvent.PROJECT_CREATED);
     }
-
+    console.log("Formik values on submit: ", formik.values);
     let updatedProject: FlowserWorkspace;
     try {
       updatedProject = isExistingProject

@@ -11,3 +11,4 @@ export * from "./flow-indexer.service";
 export * from "./flow-interactions.service";
 export * from "./flow-flix-v1.service";
 export * from "./flix-v1";
+export * from "./crypto-utils";

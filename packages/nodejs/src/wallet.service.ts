@@ -1,8 +1,14 @@
 import { ec as EC } from "elliptic";
 import { SHA3 } from "sha3";
 import { FlowCliService } from "./flow-cli.service";
-import { ensurePrefixedAddress } from "@onflowser/core";
-import { FlowAuthorizationFunction, FlowGatewayService } from "@onflowser/core";
+import {
+  ensurePrefixedAddress,
+  FlowAuthorizationFunction,
+  FlowGatewayService,
+  signMessageWithPrivateKeyHex,
+  sansPrefix,
+  withPrefix
+} from "@onflowser/core";
 import { FclArgumentWithMetadata } from "@onflowser/api";
 import { PersistentStorage } from "@onflowser/core/src/persistent-storage";
 
@@ -38,11 +44,19 @@ export type ManagedKeyPair = {
 
 // TODO(restructure-followup): Should we import existing accounts from flow.json?
 export class WalletService {
+  private userServiceKeyPair: ManagedKeyPair | null = null;
+  private actualUserServicePrivateKey: string | null = null;
+
   constructor(
     private readonly cliService: FlowCliService,
     private readonly flowGateway: FlowGatewayService,
     private readonly storageService: PersistentStorage,
   ) {}
+
+  public setUserServiceAccount(keyPair: ManagedKeyPair | null, actualPrivateKey: string | null): void {
+    this.userServiceKeyPair = keyPair;
+    this.actualUserServicePrivateKey = actualPrivateKey;
+  }
 
   public async sendTransaction(
     request: SendTransactionRequest,
@@ -88,50 +102,89 @@ export class WalletService {
     managedKeyPairs: ManagedKeyPair[];
   }): Promise<FlowAuthorizationFunction> {
     const { address, managedKeyPairs } = options;
-    const managedKeyPairsOfAccount = managedKeyPairs.filter(
-      (e) => e.address === address,
-    );
-
-    if (managedKeyPairsOfAccount.length === 0) {
-      throw new Error(`Private keys not found for account: ${address}`);
-    }
-
-    const managedKeyToUse = managedKeyPairsOfAccount[0];
-
-    const account = await this.flowGateway.getAccount(address);
-    const associatedPublicKey = account.keys.find(
-      (key) => key.publicKey === managedKeyToUse.publicKey,
-    );
-
-    if (!associatedPublicKey) {
-      throw new Error(
-        `Associated public key not found for account: ${account}`,
+    // Check if this is the user service account and its actual private key is known
+    if (
+      this.userServiceKeyPair &&
+      address === this.userServiceKeyPair.address &&
+      this.actualUserServicePrivateKey
+    ) {
+      const account = await this.flowGateway.getAccount(address);
+      // Find the keyId for the user service account's public key
+      const serviceKey = account.keys.find(
+        (key) => key.publicKey === this.userServiceKeyPair!.publicKey,
       );
-    }
+      const keyIdToUse = serviceKey?.index;
 
-    const authn: FlowAuthorizationFunction = (
-      fclAccount: Record<string, unknown> = {},
-    ) => ({
-      ...fclAccount,
-      tempId: `${address}-${managedKeyToUse.privateKey}`,
-      addr: fcl.sansPrefix(address),
-      keyId: associatedPublicKey.index,
-      signingFunction: (signable: any) => {
-        if (!managedKeyToUse.privateKey) {
-          throw new Error("Private key not found");
-        }
-        return {
-          addr: fcl.withPrefix(address),
-          keyId: associatedPublicKey.index,
-          signature: this.signWithPrivateKey(
-            managedKeyToUse.privateKey,
+      if (keyIdToUse === undefined) {
+        throw new Error(
+          `Public key ${this.userServiceKeyPair.publicKey} not found on account ${address} for user service account.`,
+        );
+      }
+      const currentUserServicePrivateKey = this.actualUserServicePrivateKey;
+
+      return async (fclAccount: Record<string, unknown> = {}) => ({
+        ...fclAccount,
+        tempId: `${address}-user-service-key`,
+        addr: sansPrefix(address),
+        keyId: keyIdToUse,
+        signingFunction: async (signable: { message: string }) => ({
+          addr: withPrefix(address),
+          keyId: keyIdToUse,
+          signature: signMessageWithPrivateKeyHex(
+            currentUserServicePrivateKey,
             signable.message,
           ),
-        };
-      },
-    });
+        }),
+      });
+    } else {
+      // Existing logic for keys managed by WalletService's storage
+      const managedKeyPairsOfAccount = managedKeyPairs.filter(
+        (e) => e.address === address,
+      );
 
-    return authn;
+      if (managedKeyPairsOfAccount.length === 0) {
+        throw new Error(`Private keys not found for account: ${address} in WalletService storage.`);
+      }
+
+      const managedKeyToUse = managedKeyPairsOfAccount[0];
+
+      const account = await this.flowGateway.getAccount(address);
+      const associatedPublicKey = account.keys.find(
+        (key) => key.publicKey === managedKeyToUse.publicKey,
+      );
+
+      if (!associatedPublicKey) {
+        throw new Error(
+          `Associated public key ${managedKeyToUse.publicKey} not found on account ${address} (from WalletService storage).`,
+        );
+      }
+
+      const authn: FlowAuthorizationFunction = (
+        fclAccount: Record<string, unknown> = {},
+      ) => ({
+        ...fclAccount,
+        tempId: `${address}-${managedKeyToUse.privateKey}`,
+        addr: fcl.sansPrefix(address),
+        keyId: associatedPublicKey.index,
+        signingFunction: (signable: any) => {
+          if (!managedKeyToUse.privateKey || managedKeyToUse.privateKey === "managed-by-workspace-settings") {
+            // This condition should ideally not be met if the above user service key path was taken.
+            // If it's the placeholder, it means we expected it to be handled by the user service key logic.
+            throw new Error(`Private key for ${address} is a placeholder or missing; it should be handled by user service key logic.`);
+          }
+          return {
+            addr: fcl.withPrefix(address),
+            keyId: associatedPublicKey.index,
+            signature: this.signWithPrivateKey(
+              managedKeyToUse.privateKey,
+              signable.message,
+            ),
+          };
+        },
+      });
+
+      return authn;
+    }
   }
 
   public async synchronizeIndex() {
@@ -201,7 +254,15 @@ export class WalletService {
 
   public async listKeyPairs() {
     const data = await this.storageService.read();
-    return JSON.parse(data ?? "[]") as ManagedKeyPair[];
+    let keyPairs = JSON.parse(data ?? "[]") as ManagedKeyPair[];
+
+    if (this.userServiceKeyPair) {
+      // Avoid duplicates if the address is already somehow in storage
+      keyPairs = keyPairs.filter(kp => kp.address !== this.userServiceKeyPair!.address);
+      keyPairs.push(this.userServiceKeyPair);
+    }
+
+    return keyPairs;
   }
 
   private async writeKeyPairs(keyPairs: ManagedKeyPair[]) {
